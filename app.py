@@ -148,7 +148,6 @@ def predict_image(model, image):
     if img_hash in feedback_memory:
         return feedback_memory[img_hash]["label"], 1.0, img_hash
 
-    # model prediction
     tensor = preprocess_image(image).to(DEVICE)
     with torch.no_grad():
         out = model(tensor)
@@ -158,7 +157,6 @@ def predict_image(model, image):
     pred = CLASSES[idx.item()]
     conf = float(conf.item())
 
-    # forensic calculations
     freq = frequency_artifact_score(image)
     sharp = sharpness_score(image)
     noise = noise_level(image)
@@ -196,10 +194,19 @@ if uploaded:
     model = load_model()
     pred, conf, img_hash = predict_image(model, image)
 
+    # ----------------------------
+    # COLORFUL PREDICTIONS
+    # ----------------------------
     st.subheader("Prediction")
-    st.write(f"**Label:** {pred}")
-    st.write(f"**Confidence:** {conf*100:.2f}%")
 
+    if pred == "real":
+        st.success(f"REAL 🧍‍♂️ — Confidence: {conf*100:.2f}%")
+    else:
+        st.error(f"FAKE 🤖 — Confidence: {conf*100:.2f}%")
+
+    # ----------------------------
+    # FEEDBACK FORM
+    # ----------------------------
     st.subheader("Is the prediction correct?")
     with st.form("feedback_form"):
         correct = st.radio("Correct label:", ["real", "fake"])
