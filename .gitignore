@@ -1,8 +1,0 @@
-
-.venv/
-__pycache__/
-outputs/
-experiments/
-*.ckpt
-*.pt
-*.pth
