@@ -1,16 +1,24 @@
+# PyTorch & vision/audio libs
 torch>=2.0.0
 torchvision>=0.15.0
 torchaudio>=2.0.0
-opencv-python
-pandas
-numpy
-tqdm
-scikit-learn
-matplotlib
 
-# Runtime dependencies required by the Streamlit app
+# Core dependencies
+numpy
+pandas
+scikit-learn
+tqdm
+matplotlib
+opencv-python-headless
+scipy
+
+# DeepFake Forensic Tools
 imagehash
 PyWavelets
-pillow
-scipy
+
+# Streamlit App
 streamlit
+pillow
+
+# Optional but recommended for safety
+requests
