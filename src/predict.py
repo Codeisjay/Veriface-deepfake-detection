@@ -77,7 +77,10 @@ def generate_crops(img, crop=224):
 def load_feedback():
     if os.path.exists(FEEDBACK_FILE):
         with open(FEEDBACK_FILE, "r") as f:
-            stored = json.load(f)
+            try:
+                stored = json.load(f)
+            except Exception:
+                stored = {}
         # convert lists back to numpy for runtime
         memory = {
             "entries": [
@@ -87,7 +90,7 @@ def load_feedback():
                     "time": e.get("time", 0),
                     "id": e.get("id", None)
                 }
-                for e in stored.get("entries", [])
+                for e in stored.get("entries", []) if "embedding" in e and "label" in e
             ],
             "prototypes": {k: np.array(v, dtype=np.float32) for k, v in stored.get("prototypes", {}).items()},
             "classifier": stored.get("classifier", None)  # will be dict of weights/bias
@@ -98,13 +101,26 @@ def load_feedback():
 
 
 def save_feedback(memory):
-    # convert numpy arrays to lists for JSON storing
+    # normalize structure and convert numpy arrays to lists for JSON storing
+    entries = []
+    for e in memory.get("entries", []):
+        emb = e.get("embedding")
+        if isinstance(emb, np.ndarray):
+            emb_list = emb.tolist()
+        else:
+            emb_list = list(map(float, emb)) if emb is not None else []
+        entries.append({"embedding": emb_list, "label": e.get("label"), "time": e.get("time", 0), "id": e.get("id")})
+
+    prototypes = {}
+    for k, v in memory.get("prototypes", {}).items():
+        if isinstance(v, np.ndarray):
+            prototypes[k] = v.tolist()
+        else:
+            prototypes[k] = list(map(float, v))
+
     stored = {
-        "entries": [
-            {"embedding": e["embedding"].tolist(), "label": e["label"], "time": e["time"], "id": e.get("id")}
-            for e in memory["entries"]
-        ],
-        "prototypes": {k: v.tolist() for k, v in memory.get("prototypes", {}).items()},
+        "entries": entries,
+        "prototypes": prototypes,
         "classifier": memory.get("classifier", None)
     }
     with open(FEEDBACK_FILE, "w") as f:
@@ -132,8 +148,11 @@ def classifier_from_state(state_dict):
         return model
     w = np.array(state_dict["weight"], dtype=np.float32)
     b = np.array(state_dict["bias"], dtype=np.float32)
-    model.fc.weight.data.copy_(torch.from_numpy(w))
-    model.fc.bias.data.copy_(torch.from_numpy(b))
+    # ensure shapes are correct
+    if w.shape == model.fc.weight.data.shape:
+        model.fc.weight.data.copy_(torch.from_numpy(w))
+    if b.shape == model.fc.bias.data.shape:
+        model.fc.bias.data.copy_(torch.from_numpy(b))
     return model
 
 
@@ -147,6 +166,8 @@ def classifier_to_state(model):
 # ---------- Memory helpers: add / prune / prototype update ----------
 def add_memory_example(memory, embedding, label, uid=None):
     # embedding: numpy array (normalized)
+    if "entries" not in memory:
+        memory["entries"] = []
     entry = {"embedding": embedding.astype(np.float32), "label": label, "time": time.time(), "id": uid}
     memory["entries"].append(entry)
     # prune if needed (oldest first)
@@ -169,11 +190,11 @@ def update_prototype(memory, embedding, label):
 
 def knn_vote(memory, embedding, k=7):
     # returns (label, avg_similarity, counts) where counts is dict
-    if not memory["entries"]:
+    if not memory.get("entries"):
         return None, 0.0, {}
     sims = []
     for e in memory["entries"]:
-        sims.append((np.dot(embedding, e["embedding"]), e["label"]))
+        sims.append((float(np.dot(embedding, e["embedding"])), e["label"]))
     sims.sort(key=lambda x: x[0], reverse=True)
     top = sims[:k]
     counts = {}
@@ -207,9 +228,11 @@ def apply_feedback_policy(probs, embedding, memory, classifier):
         with torch.no_grad():
             x = torch.from_numpy(embedding).float().unsqueeze(0).to(device)
             logits = classifier(x).cpu().numpy().flatten()
-            clf_probs = np.exp(logits) / np.sum(np.exp(logits))
+            # stable softmax
+            exps = np.exp(logits - np.max(logits))
+            clf_probs = exps / np.sum(exps)
         # combine with weight (classifier weight grows if we have memory)
-        clf_w = 0.5 if memory["entries"] else 0.0
+        clf_w = 0.5 if memory.get("entries") else 0.0
         adjusted = (1 - clf_w) * adjusted + clf_w * clf_probs
 
     # 2) prototype bias
@@ -267,19 +290,22 @@ def online_finetune(classifier, memory, new_emb, new_label, steps=ONLINE_TRAIN_S
     # build dataset: sample from memory uniformly up to batch size-1 and add new example
     examples = []
     labels = []
-    # convert labels to 0/1
+
     def lab2idx(l): return 0 if l == "real" else 1
-    # sample random examples
-    mem_entries = memory["entries"]
-    # shuffle copy to avoid altering original
+
+    mem_entries = memory.get("entries", [])
     if mem_entries:
-        idxs = np.random.choice(len(mem_entries), size=min(len(mem_entries), ONLINE_BATCH_SIZE - 1), replace=False)
-        for i in idxs:
-            examples.append(mem_entries[i]["embedding"])
-            labels.append(lab2idx(mem_entries[i]["label"]))
+        n_sample = min(len(mem_entries), ONLINE_BATCH_SIZE - 1)
+        if n_sample > 0:
+            idxs = np.random.choice(len(mem_entries), size=n_sample, replace=False)
+            for i in idxs:
+                examples.append(mem_entries[i]["embedding"])
+                labels.append(lab2idx(mem_entries[i]["label"]))
+
     # add new example
     examples.append(new_emb)
     labels.append(lab2idx(new_label))
+
     X = torch.from_numpy(np.vstack(examples)).float().to(device)  # (N, D)
     y = torch.from_numpy(np.array(labels, dtype=np.int64)).to(device)
 
@@ -296,7 +322,7 @@ def online_finetune(classifier, memory, new_emb, new_label, steps=ONLINE_TRAIN_S
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-    # after training return classifier state dict (serializable)
+    # after training return classifier
     return classifier
 
 
@@ -355,8 +381,8 @@ if __name__ == "__main__":
             print("Invalid label. aborting feedback.")
         else:
             correct_label = "real" if correct == "REAL" else "fake"
-            # update memory
-            add_memory_example(memory, embedding, correct_label, uid=str(hash(args.image)))
+            # update memory (no file-path uid — we store by embedding similarity)
+            add_memory_example(memory, embedding, correct_label, uid=None)
             update_prototype(memory, embedding, correct_label)
 
             # train online classifier with replay + new sample
@@ -372,11 +398,10 @@ if __name__ == "__main__":
         if np.max(probs) > auto_confidence_threshold:
             # add pseudo-labeled example (optional)
             chosen = "real" if np.argmax(probs) == 0 else "fake"
-            add_memory_example(memory, embedding, chosen, uid=str(hash(args.image)))
+            add_memory_example(memory, embedding, chosen, uid=None)
             update_prototype(memory, embedding, chosen)
             memory["classifier"] = classifier_to_state(classifier)
             save_feedback(memory)
             print("👍 Confident — stored pseudo-example to memory to help future similar images.")
         else:
             print("👍 Great!")
-
